@@ -8,21 +8,39 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/shabbir-genetech/classify-bash/internal/adapter/claude"
 )
+
+// defaultWindow is how far back "current" reaches. The log is append-only and
+// spans months, so without a window every incident ever recorded reads as a
+// live problem — which is precisely the mistake this report exists to prevent.
+const defaultWindow = 30 * 24 * time.Hour
 
 // runDoctor reports what the log says about host schema drift, and what this
 // binary currently enumerates. It exists so schema drift is discoverable
 // without being fatal: the signal that used to live on the exit code — where it
 // could block the Bash tool — lives here instead.
+//
+// Everything actionable is scoped to a time window. Records outside it are
+// summarised as history, never as something to fix: a failloud from a bug that
+// was fixed weeks ago is not a reason to go looking now.
 func runDoctor(args []string) int {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	logFile := fs.String("log-file", "", "read records from this file instead of the journal")
+	since := fs.String("since", "", "window: a date prefix (2026-09-01), a duration (7d, 24h), or all")
 	if err := fs.Parse(args); err != nil {
+		fmt.Fprintf(os.Stderr, "classify-bash doctor: %v\n", err)
+		return exitMalfunction
+	}
+	cutoff, windowLabel, err := resolveWindow(*since)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "classify-bash doctor: %v\n", err)
 		return exitMalfunction
 	}
@@ -38,44 +56,137 @@ func runDoctor(args []string) int {
 		fmt.Println("  classify-bash hook --mode=… --log --log-to=auto")
 		return exitReadOnly
 	}
-	fmt.Printf("log source:       %s (%d records)\n\n", source, len(records))
 
-	counts := map[string]int{}
-	reasons := map[string]map[string]int{}
-	for _, r := range records {
-		counts[r.Kind]++
-		if r.Kind == "fallthrough" || r.Reason == "" {
-			continue
-		}
-		if reasons[r.Kind] == nil {
-			reasons[r.Kind] = map[string]int{}
-		}
-		reasons[r.Kind][r.Reason]++
+	st := summarise(records, cutoff)
+	fmt.Printf("log source:       %s (%d records)\n", source, len(records))
+	fmt.Printf("window:           %s\n\n", windowLabel)
+
+	fmt.Printf("  %-22s %8s %9s  %s\n", "kind", "window", "all-time", "last seen")
+	for _, kind := range sortedKeys(st.allTime) {
+		fmt.Printf("  %-22s %8d %9d  %s\n",
+			kind, st.inWindow[kind], st.allTime[kind], st.lastSeen[kind])
 	}
 
-	for _, kind := range sortedKeys(counts) {
-		fmt.Printf("  %-22s %d\n", kind, counts[kind])
-	}
+	acted := false
 
-	// The two that mean "act on me": a field we do not enumerate, and a
-	// registration still using the pre-subcommand invocation.
-	if drift := reasons["schema_drift"]; len(drift) > 0 {
-		fmt.Println("\nUnenumerated fields seen (add to event.go to silence):")
+	// Only warn when the drift is inside the window: a field enumerated weeks
+	// ago still has records, and reporting those as outstanding would send the
+	// reader to fix something already fixed.
+	if drift := st.reasonsInWindow["schema_drift"]; len(drift) > 0 {
+		acted = true
+		fmt.Println("\nUnenumerated fields seen in window (add to event.go to silence):")
 		for _, r := range sortedKeys(drift) {
 			fmt.Printf("  %-40s ×%d\n", r, drift[r])
 		}
 	}
-	if counts["deprecated_invocation"] > 0 {
-		fmt.Println("\nThe hook is still registered with the pre-subcommand invocation.")
+
+	if registrationLooksStale(st) {
+		acted = true
+		fmt.Println("\nThe hook appears to still use the pre-subcommand invocation.")
 		fmt.Println("Update it to:  classify-bash hook --mode=claude-strict --log --log-to=auto")
 	}
-	if fl := reasons["failloud"]; len(fl) > 0 {
-		fmt.Println("\nBLOCKED calls (these exited 2 and stopped a tool call):")
+
+	if fl := st.reasonsInWindow["failloud"]; len(fl) > 0 {
+		acted = true
+		fmt.Println("\nBLOCKED calls in window (these exited 2 and stopped a tool call):")
 		for _, r := range sortedKeys(fl) {
 			fmt.Printf("  %-40s ×%d\n", r, fl[r])
 		}
 	}
+
+	// History, stated as history.
+	if n := st.allTime["failloud"] - st.inWindow["failloud"]; n > 0 {
+		fmt.Printf("\n%d older failloud record(s) predate the window (most recent %s).\n",
+			n, st.lastSeen["failloud"])
+		fmt.Println("Those are history, not an outstanding problem — re-run with --since=all to inspect.")
+	}
+
+	if !acted {
+		fmt.Println("\nNothing to act on in this window.")
+	}
 	return exitReadOnly
+}
+
+// registrationLooksStale answers "is the hook STILL registered with the
+// pre-subcommand invocation?".
+//
+// A count cannot answer that: a single record from before the registration was
+// updated would warn forever, sending the reader to fix something already
+// fixed. The question is whether the newest hook activity of any kind is that
+// deprecation — if anything newer was logged, the registration has moved on.
+func registrationLooksStale(st stats) bool {
+	last := st.lastSeen["deprecated_invocation"]
+	return last != "" && last >= st.lastActivity
+}
+
+type stats struct {
+	allTime         map[string]int
+	inWindow        map[string]int
+	lastSeen        map[string]string
+	reasonsInWindow map[string]map[string]int
+	lastActivity    string // newest ts across every kind
+}
+
+func summarise(records []record, cutoff string) stats {
+	st := stats{
+		allTime:         map[string]int{},
+		inWindow:        map[string]int{},
+		lastSeen:        map[string]string{},
+		reasonsInWindow: map[string]map[string]int{},
+	}
+	for _, r := range records {
+		st.allTime[r.Kind]++
+		if r.TS > st.lastSeen[r.Kind] {
+			st.lastSeen[r.Kind] = r.TS
+		}
+		if r.TS > st.lastActivity {
+			st.lastActivity = r.TS
+		}
+		if r.TS < cutoff {
+			continue
+		}
+		st.inWindow[r.Kind]++
+		if r.Kind == "fallthrough" || r.Reason == "" {
+			continue
+		}
+		if st.reasonsInWindow[r.Kind] == nil {
+			st.reasonsInWindow[r.Kind] = map[string]int{}
+		}
+		st.reasonsInWindow[r.Kind][r.Reason]++
+	}
+	return st
+}
+
+var durationRe = regexp.MustCompile(`^([0-9]+)([dh])$`)
+
+// resolveWindow accepts a duration (7d, 24h), a literal timestamp prefix
+// (2026-09-01), or "all". Timestamps are RFC3339 in UTC, so a lexicographic
+// compare against a prefix is a correct date filter — the same convention the
+// triage harness uses.
+func resolveWindow(since string) (cutoff, label string, err error) {
+	switch since {
+	case "all":
+		return "", "all records", nil
+	case "":
+		c := time.Now().UTC().Add(-defaultWindow).Format(time.RFC3339)
+		return c, fmt.Sprintf("since %s (default 30d; --since=DATE|Nd|all)", c[:10]), nil
+	}
+	if m := durationRe.FindStringSubmatch(since); m != nil {
+		n, convErr := strconv.Atoi(m[1])
+		if convErr != nil {
+			return "", "", fmt.Errorf("bad --since %q", since)
+		}
+		unit := time.Hour
+		if m[2] == "d" {
+			unit = 24 * time.Hour
+		}
+		c := time.Now().UTC().Add(-time.Duration(n) * unit).Format(time.RFC3339)
+		return c, fmt.Sprintf("since %s (%s)", c[:19], since), nil
+	}
+	if len(since) < 4 || since[0] < '0' || since[0] > '9' {
+		return "", "", fmt.Errorf("bad --since %q (want a date like 2026-09-01, a duration like 7d, or all)", since)
+	}
+	return since, fmt.Sprintf("since %s", since), nil
 }
 
 type record struct {
