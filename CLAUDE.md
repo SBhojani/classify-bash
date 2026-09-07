@@ -6,40 +6,75 @@ Committed working preferences and learnings live in @.claude/memory.md.
 
 ## What this is
 
-`classify-bash` is a Claude Code **PreToolUse hook for the `Bash` tool**. It reads
-one hook event on stdin, parses the embedded shell command, and emits an `allow`
-permission decision **only** when the command matches a strict read-only
-whitelist; anything else falls through silently to the normal permission prompt
-(silent by default — see opt-in logging below). It is an accelerator, never a
-gate — see [README.md](README.md) for the contract and [DESIGN.md](DESIGN.md) for
-the rationale (allow-only, positive whitelist, tiers A–F, AST handling, the goawk
-fork, opt-in logging).
+`classify-bash` classifies a shell command against a strict read-only whitelist so
+an agent CLI can skip its permission prompt for commands that cannot have a side
+effect. It is an accelerator, never a gate — see [README.md](README.md) for the
+contract and [DESIGN.md](DESIGN.md) for the rationale (allow-only, positive
+whitelist, tiers A–F, AST handling, the goawk fork, opt-in logging).
+
+The classifier itself is **host-agnostic**. Host wire formats live behind
+subcommands: `check` (the primitive, and the contract every shim is built on),
+`hook` (Claude Code `PreToolUse`), `doctor`. pi and oh-my-pi are integrated
+through TypeScript shims in `contrib/` that call `check`.
 
 ## Architecture
 
-One event flows through a fixed pipeline; reading these in order is the fastest
-way to understand the whole thing:
+Package layout, chosen so the engine cannot see the host:
 
-- **`main.go`** — entry point. Resolve logging flags (`parseLogFlags`), decode the
-  event, classify the command, and on `decisionAllow` print the fixed allow JSON
-  (hand-written, no `encoding/json` on the emit path). Everything else is silent
-  exit 0. An unusable event goes through `failOpen` — logged as `undecodable`,
-  exit 0 — so a decode problem can never block a tool call. `failLoud` (exit 2)
-  survives only for a bad `--log-*` flag and an unknown AST node, and best-effort
-  logs a `failloud` record via the package-level `logCfg`/`currentCommand`.
-- **`log.go`** — opt-in, best-effort logging of the **non-allowed** cases
-  (fall-through + `failOpen` + `schema_drift` + `failLoud`). Off by default; configured by CLI flags
-  (`--log`/`--log-to`/`--log-file`) at the registration site, not by env. Two
-  failure classes with different strictness: log *writes* are swallowed (never
-  block); log *config* (flags) is validated strictly → `failLoud`. Journal sink is
-  stdlib `log/syslog` (no new dependency). See DESIGN.md "Logging non-allowed
-  commands".
-- **`journal_unix.go` / `journal_other.go`** — the `writeJournal` sink, split by
-  build tag because `log/syslog` is Unix-only. `_unix` (`!windows && !plan9`) uses
-  syslog; `_other` is a stub that errors so Windows/Plan9 still build (the file
-  sink works there, `journal` drops, `auto` falls back to file). Keep the binary
-  portable — `log.go` itself imports nothing OS-restricted.
-- **`event.go`** — tolerant JSON decode of the PreToolUse payload into
+```
+cmd/classify-bash/        CLI: dispatch, check, hook, doctor, policy
+internal/engine/          the classifier — no host, no JSON, no exit codes
+internal/adapter/claude/  the PreToolUse wire format
+internal/logging/         opt-in, best-effort audit log
+contrib/{omp,pi}/         agent-CLI shims (installed to $out/share)
+```
+
+Reading in this order is the fastest way to understand one event end to end:
+
+- **`cmd/classify-bash/main.go`** — subcommand dispatch, and the usage text. A
+  flags-only invocation with an event on stdin is routed to the legacy `hook`
+  path (`looksLikeLegacyHook`) so the binary and a host's registration never have
+  to be updated atomically. Usage errors exit **1**, never 2.
+- **`cmd/classify-bash/check.go`** — the host-agnostic entry point and the shim
+  contract: exit 0 read-only, 1 not, 2 this binary is broken or misused. Keep
+  those numbers stable; shims depend on 2 ≠ 1.
+- **`cmd/classify-bash/policy.go`** — the two strictness axes and the mode
+  presets. Deliberately separate from the adapter: a policy is reusable, and an
+  adapter should not smuggle one in. `legacyStrictness` is neither preset — it
+  reproduces exactly what the binary did before subcommands existed, which is
+  what makes the compat path safe to deploy.
+- **`cmd/classify-bash/hook.go`** — the Claude Code adapter body, plus
+  `failLoud` / `failOpen` / `emitAllow` and the package-level
+  `logCfg`/`currentCommand`. `failLoud` is exit 2 and therefore **blocks the
+  tool** — it is reserved for a bad `--log-*` flag and for a strictness policy the
+  operator explicitly asked to be loud about. Everything else fails open.
+- **`cmd/classify-bash/doctor.go`** — reads the log and reports drift plus the
+  adapter's field manifest. Findings are **windowed** (`--since`): reporting an
+  append-only log in the present tense once produced a confidently false
+  "the hook is still registered with the old invocation". "Is X still true?" is
+  answered by recency (`registrationLooksStale`), never by a count.
+- **`internal/engine/api.go`** — the engine's only public surface: `Classify`
+  returning `Result{Class, Err}`. `NotReadOnly` is the zero value so a forgotten
+  branch degrades to the safe answer. The engine **must never call `os.Exit`**:
+  `failLoud` here panics with an unexported type that `recoverUnknown` catches,
+  which is how five call sites deep in a recursive walk abort without the engine
+  knowing what "fail" means to a host. Non-matching panics are re-panicked — a
+  bare `recover()` would turn a real bug into a silent permanent "nothing is ever
+  read-only".
+- **`internal/logging/log.go`** — opt-in, best-effort logging of the
+  **non-allowed** cases (fall-through + `undecodable` + `schema_drift` +
+  `failloud` + `deprecated_invocation`). Off by default; configured by CLI flags
+  at the registration site, not by env. Two failure classes with different
+  strictness: log *writes* are swallowed (never block); log *config* (flags) is
+  validated strictly → `failLoud`. Journal sink is stdlib `log/syslog` (no new
+  dependency). See DESIGN.md "Logging non-allowed commands".
+- **`internal/logging/journal_unix.go` / `journal_other.go`** — the `writeJournal`
+  sink, split by build tag because `log/syslog` is Unix-only. `_unix`
+  (`!windows && !plan9`) uses syslog; `_other` is a stub that errors so
+  Windows/Plan9 still build (the file sink works there, `journal` drops, `auto`
+  falls back to file). Keep the binary portable — `log.go` itself imports nothing
+  OS-restricted.
+- **`internal/adapter/claude/event.go`** — tolerant JSON decode of the PreToolUse payload into
   `event`/`toolInput`, plus `unknownFields` for drift reporting. Only `command` is
   read; every other field is enumerated as an ignored `json.RawMessage`, and the
   known-field sets are derived from those struct tags by reflection — so the
@@ -48,7 +83,7 @@ way to understand the whole thing:
   `DisallowUnknownFields`**: `PreToolUse` exit 2 blocks the tool, so rejecting a
   harmless new harness field takes the whole Bash tool down (it did, repeatedly —
   see DESIGN.md "Defensive JSON contract").
-- **`classify.go`** — the shell-AST walk. `classifyCommand` parses with
+- **`internal/engine/classify.go`** — the shell-AST walk. `classifyCommand` parses with
   `mvdan.cc/sh/v3/syntax`, then recurses: `&&`/`||`/pipe/`(subshell)` recurse,
   every other compound kind is rejected, an unknown AST node calls `failLoud`.
   `wordLiteral` rejects any word with expansion (`$VAR`, `$(...)`, `<(...)`, …).
@@ -58,7 +93,7 @@ way to understand the whole thing:
   spec only as an opaque positional, only for an `ArgvDataSafe` command. The
   command name must stay literal. `safeRedirect` allows reads and writes only to
   `/dev/null`.
-- **`spec.go`** — `commandSpec` + the five `flagStyle` matchers (`matchGNU`,
+- **`internal/engine/spec.go`** — `commandSpec` + the five `flagStyle` matchers (`matchGNU`,
   `matchFind`, `matchWrapper`, `matchXargs`, `matchAwk`). This is the
   flag/subcommand/positional engine; the data it runs on lives in `commands.go`.
   `matchXargs` is the odd one out: no `--` separator (the first non-flag token is
@@ -67,13 +102,13 @@ way to understand the whole thing:
   DESIGN.md's "styleXargs and the stdin-argv hazard". The matchers take
   `[]argToken` (literal-or-substituted), so a `"$(...)"` operand reaches a spec
   only as an opaque positional, gated by the same `ArgvDataSafe` flag.
-- **`commands.go`** — the actual whitelist data: `safeCommands` maps each command
+- **`internal/engine/commands.go`** — the actual whitelist data: `safeCommands` maps each command
   name to a `commandSpec`. This is where you add/extend allowed commands. The
   `ArgvDataSafe` flag on a spec marks a command safe to receive an attacker-
   controlled argv token (from `xargs` stdin or a `$(...)` substitution); it is the
   single source of truth for that — no parallel list — set only on leaf readers
   with no write path under any argv.
-- **`awk.go`** — `classifyAwkProgram` walks an awk program's AST (via the goawk
+- **`internal/engine/awk.go`** — `classifyAwkProgram` walks an awk program's AST (via the goawk
   fork) for `styleAwk`, positively whitelisting nodes/builtins.
 
 The safety argument is structural: the hook only ever *adds* an `allow`. A bug

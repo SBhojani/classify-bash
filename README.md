@@ -1,31 +1,70 @@
 # classify-bash
 
-A Claude Code PreToolUse hook for the `Bash` tool. Reads a single hook event
-on stdin, parses the embedded shell command with `mvdan.cc/sh/v3/syntax`, and
-emits an `allow` permission decision **only** when the command matches a
-strict whitelist of read-only forms.
+Classifies a shell command against a strict whitelist of read-only forms, so an
+agent CLI can skip its permission prompt for commands that cannot have a side
+effect. Parsing is a real AST walk over `mvdan.cc/sh/v3/syntax`, not pattern
+matching.
+
+The classifier is host-agnostic and reached through `check`. Host wire formats
+live behind subcommands: `hook` speaks Claude Code's `PreToolUse` protocol, and
+pi / oh-my-pi are integrated through extension shims that call `check`.
+
+## Commands
+
+```
+classify-bash check '<command>'      classify one command from argv
+classify-bash check --stdin          classify the command read from stdin
+    --json                           print {"class","reason"} on stdout
+    --on-unknown-ast=fail|fallthrough
+  exit 0 = read-only, 1 = not read-only, 2 = this binary is broken or misused
+
+classify-bash hook --mode=<mode>     run as a Claude Code PreToolUse hook
+    --mode=claude-strict|claude-lenient
+    --on-unknown-field=fail|log|ignore   (overrides --mode)
+    --on-unknown-ast=fail|fallthrough    (overrides --mode)
+    --log --log-to=auto|journal|file --log-file=PATH
+
+classify-bash doctor                 report schema drift and compatibility
+    --since=DATE|Nd|all              window for actionable findings (default 30d)
+```
+
+**`check` is the integration contract.** Prefer `--stdin` over argv in a shim: no
+`ARG_MAX` ceiling, no shell-escaping round trip, and the command never appears in
+the process table or a shell history. Exit 2 is deliberately distinct from 1 so a
+caller can tell "this binary is broken" from "this command is not safe", and warn
+once rather than silently downgrading every command.
+
+Integrating another agent CLI means calling `check` from whatever that host calls
+a pre-execution hook. The shipped shims (below) are worked examples.
 
 ## Design
 
-- **Allow-only.** The hook never emits `deny` or `ask`. Unsafe or
-  unclassifiable commands fall through (exit 0 with no stdout) to Claude
-  Code's normal permission prompt. We accelerate, we do not gate.
-  These non-allowed cases can optionally be logged — see [Logging](#logging-opt-in).
+- **Allow-only, and it must stay that way.** The tool only ever *adds* an allow.
+  Unsafe or unclassifiable commands fall through to the host's own permission
+  flow. A bug here can at worst fail to accelerate; it must never block. This is
+  why exit 2 is reserved so narrowly — under `PreToolUse`, exit 2 *blocks the
+  tool*, so anything that can exit 2 can take the Bash tool down.
+- **The engine cannot exit.** Classification is a pure function returning a
+  `Class` (`ReadOnly` / `NotReadOnly` / `Unparseable`), never a permission
+  decision — what "not read-only" should cost a user is the host's business, and
+  the supported hosts disagree about it. `NotReadOnly` is the zero value so a
+  forgotten branch degrades to the safe answer.
 - **Strict whitelist.** Every command, subcommand, and flag is enumerated
-  positively in `commands.go`. Unknown command, unknown subcommand, or
-  unknown flag on a known command → fall through. We never write
-  "allow X except when Y" because a future release may introduce a Z we
-  did not anticipate.
+  positively in `internal/engine/commands.go`. Unknown command, unknown
+  subcommand, or unknown flag on a known command → fall through. We never write
+  "allow X except when Y" because a future release may introduce a Z we did not
+  anticipate.
 - **Defensive contract, but never at the cost of blocking.** The event must
   declare `hook_event_name == "PreToolUse"` and `tool_name == "Bash"` and carry a
-  non-empty command; anything else **falls through** (exit 0, empty stdout) and is
-  recorded as an `undecodable` log line. **Unknown fields are tolerated** — a
-  field the harness adds after this binary was built is recorded as
-  `schema_drift` and ignored, never rejected. An unrecognized `mvdan/sh` AST node
-  kind is the one remaining loud failure (exit 2): there we would rather block
-  than silently ship a stale classifier.
+  non-empty command; anything else **falls through** and is recorded as an
+  `undecodable` log line. **Unknown fields are tolerated** — a field the harness
+  adds after this binary was built is recorded as `schema_drift` and ignored,
+  never rejected. (Rejecting them is what took the Bash tool down for entire
+  sessions, twice; see DESIGN.md.)
 
 ## Failure modes
+
+`hook` — nothing here blocks except by explicit request:
 
 | Situation                                           | Exit | Stdout      | Stderr                          |
 | --------------------------------------------------- | ---- | ----------- | ------------------------------- |
@@ -34,8 +73,36 @@ strict whitelist of read-only forms.
 | Bash parser refuses the input                       | 0    | empty       | empty                           |
 | Unknown field in the event                          | 0    | as normal   | empty (logged as `schema_drift`)|
 | Undecodable / wrong event / empty command           | 0    | empty       | empty (logged as `undecodable`) |
+| Unknown field **under `--on-unknown-field=fail`**   | 2    | empty       | `classify-bash: unknown field(s): ...` |
 | Bad `--log-*` flag                                  | 2    | empty       | `classify-bash: bad flag: ...`  |
-| Unknown `mvdan/sh` AST node kind                    | 2    | empty       | `classify-bash: unknown ...`    |
+| Unknown `mvdan/sh` AST node kind (unless `--on-unknown-ast=fallthrough`) | 2 | empty | `classify-bash: unknown ...` |
+
+`check` — a verdict, not a permission decision:
+
+| Situation | Exit | Stdout |
+| --- | --- | --- |
+| Read-only | 0 | verdict JSON with `--json`, else empty |
+| Not read-only, or undetermined | 1 | as above |
+| Bad flag, missing/ambiguous command | 2 | empty (message on stderr) |
+
+A usage error exits **1**, never 2 — a mis-invocation must not be able to block a
+tool call.
+
+### Modes
+
+`--mode` is a preset over the two strictness axes, which are otherwise
+independent of which host adapter is in use:
+
+| Mode | `--on-unknown-field` | `--on-unknown-ast` |
+| --- | --- | --- |
+| `claude-strict` | `fail` | `fail` |
+| `claude-lenient` | `log` | `fallthrough` |
+
+**Choose `claude-strict` knowingly.** `--on-unknown-field=fail` is the behaviour
+that blocked every Bash call for whole sessions when the harness added a field,
+and every unknown field ever observed has been a benign addition. It is offered
+because the axis should exist, not because failing is recommended. Either axis
+can be overridden per invocation.
 
 ## Logging (opt-in)
 
@@ -47,7 +114,7 @@ blocks a call.
 
 Because unknown fields no longer block, `schema_drift` records are how you learn
 the harness changed shape: enumerate the reported field on the struct in
-`event.go` to silence it.
+`internal/adapter/claude/event.go` to silence it.
 
 | Flag         | Default                              | Meaning                                                                       |
 | ------------ | ------------------------------------ | ----------------------------------------------------------------------------- |
@@ -109,13 +176,15 @@ notices (goawk/MIT, mvdan/sh/BSD-3-Clause) for **binary** redistribution.
 It is a plain Go module — no Nix required to build or install:
 
 ```bash
-# Install the latest published version straight onto $PATH:
-go install github.com/shabbir-genetech/classify-bash@latest
-
-# Or from a checkout:
-go build -o classify-bash .   # or: go install .
+# From a checkout:
+go build ./...                # binary lands as ./classify-bash
 go test ./...
 ```
+
+> **Note on `go install …@latest`.** The module path is still
+> `github.com/shabbir-genetech/classify-bash`, so `go install` of that path
+> fetches **upstream**, not this fork — upstream does not have the fail-open
+> decoder or the subcommands. Build from a checkout, or use the Nix package.
 
 Put the resulting binary on `$PATH` and register it the same way (see
 [Registration](#registration)). Two notes:
@@ -132,15 +201,28 @@ Put the resulting binary on `$PATH` and register it the same way (see
 
 ## Manual smoke test
 
+The host-agnostic path needs no JSON at all:
+
 ```bash
-./result/bin/classify-bash <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls -la"}}'
+./result/bin/classify-bash check 'ls -la /tmp'          # exit 0
+./result/bin/classify-bash check 'rm -rf /tmp/x'        # exit 1
+printf 'cat /etc/hostname | grep foo' | ./result/bin/classify-bash check --stdin --json
+# -> {"class":"read_only","reason":""}
+```
+
+The Claude Code adapter:
+
+```bash
+CB=./result/bin/classify-bash
+$CB hook --mode=claude-strict <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls -la"}}'
 # -> {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
 
-./result/bin/classify-bash <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}'
+$CB hook --mode=claude-strict <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}'
 # -> (no output, exit 0)
 
-# An unknown field does not disturb classification; it is logged as schema_drift.
-./result/bin/classify-bash <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"surprise":true}'
+# An unknown field does not disturb classification under claude-lenient; it is
+# logged as schema_drift. Under claude-strict it exits 2 and blocks the call.
+$CB hook --mode=claude-lenient <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"surprise":true}'
 # -> {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
 ```
 
@@ -148,14 +230,14 @@ Logging is off by default. Enable it (here to a file) and a non-allowed command 
 recorded as one JSON line; allowed commands are not:
 
 ```bash
-./result/bin/classify-bash --log --log-to=file --log-file=/tmp/cb.log \
+$CB hook --mode=claude-lenient --log --log-to=file --log-file=/tmp/cb.log \
   <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}'
 cat /tmp/cb.log
 # -> {"ts":"…Z","kind":"fallthrough","command":"rm -rf /tmp/x"}
 
-# A bad flag is the one strict config path — it exits 2 and blocks the call.
-# (Operator error at the registration site; nothing upstream can cause it.)
-./result/bin/classify-bash --log --log-to=banana <<<'…'
+# A bad flag is the one config path that is strict by design — operator error at
+# the registration site, which nothing upstream can cause.
+$CB hook --mode=claude-lenient --log --log-to=banana <<<'…'
 # -> classify-bash: bad flag: unknown --log-to "banana" (want auto, journal, or file)
 # -> (exit 2)
 ```
@@ -174,7 +256,7 @@ Once the binary is on `$PATH`, add this to `~/.claude/settings.json`:
       {
         "matcher": "Bash",
         "hooks": [
-          {"type": "command", "command": "classify-bash"}
+          {"type": "command", "command": "classify-bash hook --mode=claude-lenient --log --log-to=auto"}
         ]
       }
     ]
@@ -182,8 +264,39 @@ Once the binary is on `$PATH`, add this to `~/.claude/settings.json`:
 }
 ```
 
-To turn on the audit log (see [Logging](#logging-opt-in)), pass the flags in the
-command, e.g. `"command": "classify-bash --log --log-to=auto"`.
+`--log --log-to=auto` turns on the audit log (see [Logging](#logging-opt-in));
+drop those flags for silent operation. `claude-lenient` is recommended for a
+deployed registration — see the mode table above for what `claude-strict` costs.
+
+A **flags-only invocation without the `hook` subcommand still works**, logging a
+`deprecated_invocation` record. That compatibility path exists so the binary and
+the host's registration never have to be updated atomically; without it, a
+mismatch leaves you needing the Bash tool to repair the Bash tool. It will be
+removed in a future release — move registrations to the `hook` form.
+
+## Agent CLI shims
+
+The Nix package installs worked integrations for two other agent CLIs at
+`$out/share/classify-bash/`, with this binary's absolute path substituted in
+(override with `CLASSIFY_BASH_BIN`):
+
+- **`omp.ts`** — oh-my-pi. Re-registers the built-in `bash` tool with an approval
+  function that drops read-only commands to the `read` tier, so they auto-approve
+  while everything else keeps prompting. An *accelerator*: it only ever lowers the
+  tier, so with the shim absent or broken you get oh-my-pi's own default.
+- **`pi.ts`** — pi. pi has no approval system and its `tool_call` hook can only
+  block, so there is no prompt to remove; this shim *installs* a baseline instead
+  — silent for read-only, confirm otherwise, block when headless. That is a
+  behaviour change to a CLI that currently prompts for nothing, so opt in
+  deliberately.
+
+Both catch every internal error: pi and oh-my-pi each fail **closed** on a handler
+error, so an uncaught exception would block every bash call.
+
+```bash
+omp -e /path/to/share/classify-bash/omp.ts
+pi  -e /path/to/share/classify-bash/pi.ts
+```
 
 ## Extending the whitelist
 
@@ -205,7 +318,7 @@ command, e.g. `"command": "classify-bash --log --log-to=auto"`.
    evaluate — is an exec path however read-only the subcommand looks.** When in
    doubt, run the command with the flag pointed at a script that touches a
    marker file, and check whether the marker appears.
-3. Add a `commandSpec` entry in `commands.go` enumerating those flags
+3. Add a `commandSpec` entry in `internal/engine/commands.go` enumerating those flags
    positively. Document any deliberately-excluded flags in a comment so
    future reviewers see that they were considered — and say *which* kind of
    exclusion it is: a demonstrated exec/write path, or merely no logged demand.
@@ -219,7 +332,7 @@ command, e.g. `"command": "classify-bash --log --log-to=auto"`.
 
 To also let a command receive an **attacker-controlled argv token** — be
 **wrappable by `xargs`** *and* accept a `"$(...)"` command-substitution operand —
-set `ArgvDataSafe: true` on its spec in `commands.go`. Only do so if it clears a
+set `ArgvDataSafe: true` on its spec in `internal/engine/commands.go`. Only do so if it clears a
 *stronger* bar than the whitelist itself: it must have **no write/mutate path under
 any argv at all** (because xargs appends stdin items, and `$(...)` injects an
 operand value, that the classifier never sees). A command whose spec merely
@@ -268,14 +381,14 @@ and do not widen it to non-numeric values without re-deriving that argument.
 - **`styleXargs`**: stdin-append wrapper `xargs [flag…] CMD [INITIAL-ARG…]`.
   Unlike `styleWrapper` there is **no `--` separator** — the first non-flag token
   is the wrapped command. The command is accepted only if its spec is
-  **`ArgvDataSafe`** (in `commands.go`), not merely in the whitelist, and its
+  **`ArgvDataSafe`** (in `internal/engine/commands.go`), not merely in the whitelist, and its
   initial-arguments are matched recursively. The gate matters because xargs
   appends stdin items to the wrapped argv that we never see, so only commands
   with no write path under *any* argv are wrappable (see "Flag styles" rationale
   in DESIGN.md). The replace-mode flags `-I`/`-i`/`--replace` are not
   whitelisted, so `xargs -I{} sh -c …` falls through.
 - **`styleAwk`**: awk-shape command line `[flag…] PROGRAM [files…]` where the
-  script itself is classified by walking the goawk AST (`awk.go`). Allowed
+  script itself is classified by walking the goawk AST (`internal/engine/awk.go`). Allowed
   pre-program flags are short-only and take values (`-F sep`, `-v var=val`);
   the first non-flag positional is the awk program, parsed via
   `github.com/benhoyt/goawk/parser` and accepted only when every node passes

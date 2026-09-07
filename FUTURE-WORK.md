@@ -16,24 +16,32 @@ implement) · **CANDIDATE** (log-surfaced, low-risk, awaiting sign-off) ·
 **DEFERRED** (agreed valuable, parked) · **RESEARCH** (needs investigation before
 a spec).
 
-### CANDIDATE — make the unknown-AST-node failure configurable
+> **Paths:** bare filenames below (`classify.go`, `commands.go`, `spec.go`,
+> `awk.go`) are in `internal/engine/`. They sat at the repo root until the
+> package split; the file contents and line references are unchanged.
 
-`classifyCommand` calls `failLoud` (exit 2) on an `mvdan/sh` AST node kind it does
-not handle. Since `PreToolUse` exit 2 *blocks* the tool, this is now the only
-remaining path by which this binary can take the Bash tool down — the JSON decoder
-stopped being one when unknown fields became tolerated (see DESIGN.md, "Defensive
-JSON contract").
+### IMPLEMENTED — make the unknown-AST-node failure configurable
 
-The exposure is the same shape as the harness-field problem, from a different
-direction: a `mvdan.cc/sh` upgrade that introduces a node kind would block every
-command containing it. Unlike a harness field, we control when that dependency
-moves, so it is not urgent — but the asymmetry is worth closing.
+The exposure: the classifier called `failLoud` (exit 2) on an `mvdan/sh` AST node
+kind it did not handle, and since `PreToolUse` exit 2 *blocks* the tool, that was
+the last remaining path by which this binary could take the Bash tool down. Same
+shape as the harness-field problem from a different direction — an upstream parser
+upgrade introducing a node kind would block every command containing it.
 
-Proposal: an `--on-unknown-ast=fail|fallthrough` flag, defaulting to `fail` (today's
-behavior, correct while developing the classifier) with `fallthrough` recommended
-for deployed hook registrations. Open question: whether a single flag should govern
-both this and future strictness choices, or whether each unknown-kind site deserves
-its own switch.
+Shipped as `--on-unknown-ast=fail|fallthrough`, one of two strictness axes in
+`cmd/classify-bash/policy.go`, with `claude-lenient` selecting `fallthrough` for
+deployed registrations.
+
+Two decisions worth not relitigating:
+
+- **The engine no longer decides what "fail" means.** `Classify` returns a
+  `Result` carrying `Unparseable` plus the error; the *adapter* maps that to exit
+  2, a block, or an ordinary decline. The engine cannot call `os.Exit` at all.
+- **One flag, not one per site.** The open question above was whether each
+  unknown-kind site deserves its own switch. It does not: from an adapter's point
+  of view an unknown command-AST kind and an unknown awk-AST kind mean the same
+  thing — the classifier does not understand a tree it saw. Per-site switches
+  would be speculative generality with no consumer.
 
 ### Two kinds of "must not allow" (test taxonomy)
 
