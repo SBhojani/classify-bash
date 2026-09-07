@@ -17,13 +17,16 @@
     flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {inherit system;};
 
-      # Build source filtered to ONLY what the Go build reads: *.go (incl.
-      # _test.go, which checkPhase runs), go.mod, go.sum. Docs (*.md, LICENSE,
-      # THIRD_PARTY_LICENSES), scripts/, and .claude/ are excluded, so a
-      # docs-only commit does NOT change this source tree's hash → the
-      # derivation and its output are identical → consumers rebuild nothing
-      # (Nix is input-addressed; src is the input). Keep this fileset in sync if
-      # the build ever needs a non-.go asset (e.g. a //go:embed data file).
+      # Build source filtered to what the build actually reads: *.go (incl.
+      # _test.go, which checkPhase runs), go.mod, go.sum, and the agent-CLI
+      # shims under contrib/ (installed into $out/share, with the binary's store
+      # path substituted in). Docs (*.md, LICENSE, THIRD_PARTY_LICENSES),
+      # scripts/, and .claude/ are excluded, so a docs-only commit does NOT
+      # change this source tree's hash → the derivation and its output are
+      # identical → consumers rebuild nothing (Nix is input-addressed; src is
+      # the input). Editing a shim DOES rebuild, which is correct: the output
+      # changes. Keep this fileset in sync if the build ever needs another
+      # non-.go asset (e.g. a //go:embed data file).
       goSource = let
         fs = pkgs.lib.fileset;
       in
@@ -31,6 +34,7 @@
           root = ./.;
           fileset = fs.unions [
             (fs.fileFilter (f: f.hasExt "go") ./.)
+            (fs.fileFilter (f: f.hasExt "ts") ./contrib)
             ./go.mod
             ./go.sum
           ];
@@ -48,6 +52,22 @@
         # Filled in after first build attempt. `nix build` will print the
         # correct hash on the initial failure; paste it here.
         vendorHash = "sha256-DQS+zZEOz9aJfwZt6Fq5T7Hm1JQK6AJ3IqJqMzC27rU=";
+        # Install the agent-CLI shims alongside the binary, with the absolute
+        # store path of the binary substituted in. A store path rather than a
+        # PATH lookup because the shim runs inside pi/omp, whose environment is
+        # not necessarily the interactive shell's — a PATH lookup is the kind of
+        # thing that works in dev and silently stops working once installed.
+        # CLASSIFY_BASH_BIN still overrides, for testing a local build against
+        # the shipped shim.
+        postInstall = ''
+          mkdir -p $out/share/classify-bash
+          install -Dm644 contrib/omp/classify-bash.ts $out/share/classify-bash/omp.ts
+          install -Dm644 contrib/pi/classify-bash.ts $out/share/classify-bash/pi.ts
+          substituteInPlace \
+            $out/share/classify-bash/omp.ts \
+            $out/share/classify-bash/pi.ts \
+            --replace-fail '@classifyBash@' "$out/bin/classify-bash"
+        '';
         meta = {
           description = "Claude Code Bash classifier (strict read-only whitelist)";
           mainProgram = "classify-bash";
