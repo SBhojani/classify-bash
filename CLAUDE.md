@@ -23,10 +23,12 @@ way to understand the whole thing:
 - **`main.go`** — entry point. Resolve logging flags (`parseLogFlags`), decode the
   event, classify the command, and on `decisionAllow` print the fixed allow JSON
   (hand-written, no `encoding/json` on the emit path). Everything else is silent
-  exit 0. `failLoud` is the only path to exit 2 (and best-effort logs a `failloud`
-  record via the package-level `logCfg`/`currentCommand`).
+  exit 0. An unusable event goes through `failOpen` — logged as `undecodable`,
+  exit 0 — so a decode problem can never block a tool call. `failLoud` (exit 2)
+  survives only for a bad `--log-*` flag and an unknown AST node, and best-effort
+  logs a `failloud` record via the package-level `logCfg`/`currentCommand`.
 - **`log.go`** — opt-in, best-effort logging of the **non-allowed** cases
-  (fall-through + `failLoud`). Off by default; configured by CLI flags
+  (fall-through + `failOpen` + `schema_drift` + `failLoud`). Off by default; configured by CLI flags
   (`--log`/`--log-to`/`--log-file`) at the registration site, not by env. Two
   failure classes with different strictness: log *writes* are swallowed (never
   block); log *config* (flags) is validated strictly → `failLoud`. Journal sink is
@@ -37,10 +39,15 @@ way to understand the whole thing:
   syslog; `_other` is a stub that errors so Windows/Plan9 still build (the file
   sink works there, `journal` drops, `auto` falls back to file). Keep the binary
   portable — `log.go` itself imports nothing OS-restricted.
-- **`event.go`** — strict JSON decode (`DisallowUnknownFields`) of the PreToolUse
-  payload into `event`/`toolInput`. Only `command` is read; every other field is
-  enumerated as an ignored `json.RawMessage` so name-drift fails loud but
-  type-drift on ignored fields stays quiet.
+- **`event.go`** — tolerant JSON decode of the PreToolUse payload into
+  `event`/`toolInput`, plus `unknownFields` for drift reporting. Only `command` is
+  read; every other field is enumerated as an ignored `json.RawMessage`, and the
+  known-field sets are derived from those struct tags by reflection — so the
+  struct is the single source of truth. Name-drift is reported as `schema_drift`
+  and ignored; type-drift on ignored fields stays quiet. **Never reintroduce
+  `DisallowUnknownFields`**: `PreToolUse` exit 2 blocks the tool, so rejecting a
+  harmless new harness field takes the whole Bash tool down (it did, repeatedly —
+  see DESIGN.md "Defensive JSON contract").
 - **`classify.go`** — the shell-AST walk. `classifyCommand` parses with
   `mvdan.cc/sh/v3/syntax`, then recurses: `&&`/`||`/pipe/`(subshell)` recurse,
   every other compound kind is rejected, an unknown AST node calls `failLoud`.
@@ -159,14 +166,16 @@ jj.)
   parsing, rest is opaque data, so `cat file -X` allows `-X` as data), which is only
   sound when it has no flag-reachable side effect at all. So never set `ArgvDataSafe`
   on a spec with such a path. See README "Extending the whitelist" and `matchGNU`.
-- **Strict JSON decoder** (`event.go`): `DisallowUnknownFields`. When the Claude
-  Code harness starts sending a new field on the event or inside `tool_input`,
-  decoding exits 2 and BLOCKS the call. Fix: add the field as an ignored
-  `json.RawMessage` on the right struct (`event` for top-level, `toolInput` for
-  a `tool_input` field) + an accept-test. See DESIGN.md.
-- **Fail loud on the unknown**: an unrecognized `mvdan/sh` AST node, redirect op,
-  or flag style calls `failLoud` (exit 2) rather than guessing — we'd rather block
-  than ship a stale classifier. Keep new `switch` defaults loud.
+- **Tolerant JSON decoder** (`event.go`). When the harness starts sending a new
+  field on the event or inside `tool_input`, classification proceeds and a
+  `schema_drift` record names it. Enumerate it as an ignored `json.RawMessage` on
+  the right struct (`event` for top-level, `toolInput` for a `tool_input` field) +
+  an accept-test to silence it. Do NOT make this strict again — see DESIGN.md.
+- **Fail loud on the unknown, but only where nothing upstream can trigger it**: an
+  unrecognized `mvdan/sh` AST node, redirect op, or flag style calls `failLoud`
+  (exit 2) rather than guessing — we'd rather block than ship a stale classifier.
+  Keep new `switch` defaults loud. Harness-driven input is the opposite case: it
+  fails open, because there we cannot afford to block.
 - **LF line endings** enforced via `.gitattributes` (`*.go`/`*.nix`/`*.md`). CRLF
   breaks the inline shell in `flake.nix`'s checks.
 - No AI attribution in commit messages.

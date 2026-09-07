@@ -803,8 +803,11 @@ func TestNotYetAllowed(t *testing.T) {
 }
 
 // TestEventDecodeContractViolations: every case must produce a non-nil error
-// from decodeEvent. main.go converts that into a fail-loud exit; here we just
-// verify the error contract.
+// from decodeEvent. main.go converts that into a fail-OPEN exit (0, no stdout);
+// here we just verify the error contract.
+//
+// Unknown fields are deliberately absent from this list — they are no longer a
+// contract violation. See TestEventDecodeToleratesUnknownFields below.
 func TestEventDecodeContractViolations(t *testing.T) {
 	cases := []struct {
 		name string
@@ -812,8 +815,6 @@ func TestEventDecodeContractViolations(t *testing.T) {
 	}{
 		{"malformed JSON", `not json`},
 		{"truncated", `{"foo":`},
-		{"unknown top-level field", `{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"extra":1}`},
-		{"unknown nested field", `{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls","extra":1}}`},
 		{"wrong event name", `{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}`},
 		{"wrong tool name", `{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"command":"ls"}}`},
 		{"missing command", `{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}`},
@@ -823,7 +824,7 @@ func TestEventDecodeContractViolations(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := decodeEvent(strings.NewReader(c.body))
+			_, _, err := decodeEvent(strings.NewReader(c.body))
 			if err == nil {
 				t.Fatalf("decodeEvent(%q): want error, got nil", c.body)
 			}
@@ -834,8 +835,51 @@ func TestEventDecodeContractViolations(t *testing.T) {
 	}
 }
 
+// TestEventDecodeToleratesUnknownFields: the cases that used to sit in the
+// rejection list above. A field the harness adds after this binary was built
+// must decode normally and be reported as drift, never rejected — rejecting
+// them blocked every Bash call for entire sessions, twice.
+func TestEventDecodeToleratesUnknownFields(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantDrift string
+	}{
+		{
+			"unknown top-level field",
+			`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"extra":1}`,
+			"extra",
+		},
+		{
+			"unknown nested field",
+			`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls","extra":1}}`,
+			"tool_input.extra",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ev, drift, err := decodeEvent(strings.NewReader(c.body))
+			if err != nil {
+				t.Fatalf("decodeEvent(%q): unexpected error %v", c.body, err)
+			}
+			if ev.ToolInput.Command != "ls" {
+				t.Errorf("decodeEvent(%q): command = %q, want ls", c.body, ev.ToolInput.Command)
+			}
+			if len(drift) != 1 || drift[0] != c.wantDrift {
+				t.Errorf("decodeEvent(%q): drift = %v, want [%s]", c.body, drift, c.wantDrift)
+			}
+		})
+	}
+}
+
 // TestEventDecodeAccepts: valid events round-trip successfully, including the
-// full real-world event shape with all known Claude Code context fields.
+// full real-world event shape with all known Claude Code context fields, and
+// report no schema drift.
+//
+// The per-case comments below describe the harness additions historically, when
+// an unenumerated field meant exit 2. That is no longer the consequence — an
+// unknown field is now reported as drift and ignored — but each field is still
+// enumerated so it does not show up as drift on every call.
 func TestEventDecodeAccepts(t *testing.T) {
 	cases := []string{
 		// Minimal valid event (every required field, no context fields).
@@ -866,15 +910,22 @@ func TestEventDecodeAccepts(t *testing.T) {
 		// inside tool_input. Without it enumerated, the strict decoder exits 2
 		// and blocks every sandbox-disabled call.
 		`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls","dangerouslyDisableSandbox":true}}`,
+		// The harness attaches a top-level scratchpad_dir to every event. Under
+		// the strict decoder this blocked every Bash call for whole sessions —
+		// the incident that motivated tolerating unknown fields entirely.
+		`{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"scratchpad_dir":"/tmp/scratch"}`,
 	}
 	for _, body := range cases {
-		ev, err := decodeEvent(strings.NewReader(body))
+		ev, drift, err := decodeEvent(strings.NewReader(body))
 		if err != nil {
 			t.Errorf("decodeEvent(%q): unexpected error %v", body, err)
 			continue
 		}
 		if ev.HookEventName != "PreToolUse" || ev.ToolName != "Bash" {
 			t.Errorf("decodeEvent(%q): wrong fields %+v", body, ev)
+		}
+		if len(drift) != 0 {
+			t.Errorf("decodeEvent(%q): unexpected drift %v (enumerate the field on the struct)", body, drift)
 		}
 	}
 }

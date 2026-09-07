@@ -16,6 +16,25 @@ implement) · **CANDIDATE** (log-surfaced, low-risk, awaiting sign-off) ·
 **DEFERRED** (agreed valuable, parked) · **RESEARCH** (needs investigation before
 a spec).
 
+### CANDIDATE — make the unknown-AST-node failure configurable
+
+`classifyCommand` calls `failLoud` (exit 2) on an `mvdan/sh` AST node kind it does
+not handle. Since `PreToolUse` exit 2 *blocks* the tool, this is now the only
+remaining path by which this binary can take the Bash tool down — the JSON decoder
+stopped being one when unknown fields became tolerated (see DESIGN.md, "Defensive
+JSON contract").
+
+The exposure is the same shape as the harness-field problem, from a different
+direction: a `mvdan.cc/sh` upgrade that introduces a node kind would block every
+command containing it. Unlike a harness field, we control when that dependency
+moves, so it is not urgent — but the asymmetry is worth closing.
+
+Proposal: an `--on-unknown-ast=fail|fallthrough` flag, defaulting to `fail` (today's
+behavior, correct while developing the classifier) with `fallthrough` recommended
+for deployed hook registrations. Open question: whether a single flag should govern
+both this and future strictness choices, or whether each unknown-kind site deserves
+its own switch.
+
 ### Two kinds of "must not allow" (test taxonomy)
 
 The corpus splits fall-through cases by *why* they fall through, because the two

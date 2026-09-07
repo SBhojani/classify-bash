@@ -16,11 +16,13 @@ strict whitelist of read-only forms.
   unknown flag on a known command → fall through. We never write
   "allow X except when Y" because a future release may introduce a Z we
   did not anticipate.
-- **Defensive contract.** JSON input is decoded with
-  `DisallowUnknownFields`; the event must declare
-  `hook_event_name == "PreToolUse"` and `tool_name == "Bash"`. Any deviation
-  exits 2 with a `classify-bash: <reason>` line on stderr. Any unrecognized
-  `mvdan/sh` AST node kind also exits 2 — we would rather see a loud failure
+- **Defensive contract, but never at the cost of blocking.** The event must
+  declare `hook_event_name == "PreToolUse"` and `tool_name == "Bash"` and carry a
+  non-empty command; anything else **falls through** (exit 0, empty stdout) and is
+  recorded as an `undecodable` log line. **Unknown fields are tolerated** — a
+  field the harness adds after this binary was built is recorded as
+  `schema_drift` and ignored, never rejected. An unrecognized `mvdan/sh` AST node
+  kind is the one remaining loud failure (exit 2): there we would rather block
   than silently ship a stale classifier.
 
 ## Failure modes
@@ -30,16 +32,22 @@ strict whitelist of read-only forms.
 | Command matches the whitelist                       | 0    | allow JSON  | empty                           |
 | Command is unsafe, unknown, or has an unknown flag  | 0    | empty       | empty                           |
 | Bash parser refuses the input                       | 0    | empty       | empty                           |
-| JSON contract violation (incl. unknown fields)      | 2    | empty       | `classify-bash: <reason>`       |
+| Unknown field in the event                          | 0    | as normal   | empty (logged as `schema_drift`)|
+| Undecodable / wrong event / empty command           | 0    | empty       | empty (logged as `undecodable`) |
+| Bad `--log-*` flag                                  | 2    | empty       | `classify-bash: bad flag: ...`  |
 | Unknown `mvdan/sh` AST node kind                    | 2    | empty       | `classify-bash: unknown ...`    |
 
 ## Logging (opt-in)
 
 Off by default — the hook stays silent on fall-through. When enabled with `--log`,
-every **non-allowed** command is recorded as one best-effort JSON line: both the
-fall-through cases and the `failLoud` (contract-violation) cases. Allowed commands
-are never logged. Logging can only fail to record — it never changes the decision
-and never blocks a call.
+every **non-allowed** command is recorded as one best-effort JSON line, as are the
+`undecodable`, `schema_drift` and `failloud` cases. Allowed commands are never
+logged. Logging can only fail to record — it never changes the decision and never
+blocks a call.
+
+Because unknown fields no longer block, `schema_drift` records are how you learn
+the harness changed shape: enumerate the reported field on the struct in
+`event.go` to silence it.
 
 | Flag         | Default                              | Meaning                                                                       |
 | ------------ | ------------------------------------ | ----------------------------------------------------------------------------- |
@@ -51,10 +59,11 @@ Each record is one line:
 
 ```json
 {"ts":"2026-…Z","kind":"fallthrough","command":"rm -rf /tmp/x"}
-{"ts":"2026-…Z","kind":"failloud","command":"","reason":"decode stdin: json: unknown field \"surprise\""}
+{"ts":"2026-…Z","kind":"schema_drift","command":"","reason":"surprise"}
+{"ts":"2026-…Z","kind":"undecodable","command":"","reason":"decode stdin: unexpected end of JSON input"}
 ```
 
-`reason` appears only for `failloud` events; `orig_len` (original byte length)
+`reason` appears for every kind except `fallthrough`; `orig_len` (original byte length)
 appears only when the command was truncated (4 KB cap). On systemd the journal
 sink lands in journald via `/dev/log` — query `journalctl -t classify-bash` and
 grep the message. The journal sink is **Linux/macOS only** (it uses `log/syslog`);
@@ -130,9 +139,9 @@ Put the resulting binary on `$PATH` and register it the same way (see
 ./result/bin/classify-bash <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm -rf /tmp/x"}}'
 # -> (no output, exit 0)
 
+# An unknown field does not disturb classification; it is logged as schema_drift.
 ./result/bin/classify-bash <<<'{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"surprise":true}'
-# -> classify-bash: decode stdin: json: unknown field "surprise"
-# -> (exit 2)
+# -> {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}
 ```
 
 Logging is off by default. Enable it (here to a file) and a non-allowed command is
@@ -144,7 +153,8 @@ recorded as one JSON line; allowed commands are not:
 cat /tmp/cb.log
 # -> {"ts":"…Z","kind":"fallthrough","command":"rm -rf /tmp/x"}
 
-# A bad flag is strict — it exits 2 and blocks the call (like the JSON decoder):
+# A bad flag is the one strict config path — it exits 2 and blocks the call.
+# (Operator error at the registration site; nothing upstream can cause it.)
 ./result/bin/classify-bash --log --log-to=banana <<<'…'
 # -> classify-bash: bad flag: unknown --log-to "banana" (want auto, journal, or file)
 # -> (exit 2)
