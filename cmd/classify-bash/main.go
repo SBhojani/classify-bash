@@ -30,12 +30,7 @@ import (
 )
 
 func main() {
-	// The classifier cannot exit on its own — it calls back here when it meets a
-	// construct it does not recognise. Installed first so it is in place before
-	// anything can classify.
-	engine.OnUnknownConstruct = failLoud
-
-	// Resolve logging config next, before anything that can failLoud, so the
+	// Resolve logging config first, before anything that can failLoud, so the
 	// global is in place. Strict: a bad flag failLouds (exit 2).
 	cfg, err := logging.ParseLogFlags(os.Args[1:])
 	if err != nil {
@@ -54,7 +49,17 @@ func main() {
 	}
 	currentCommand = ev.ToolInput.Command
 
-	if engine.ClassifyCommand(ev.ToolInput.Command) {
+	res := engine.Classify(ev.ToolInput.Command)
+	if res.Err != nil {
+		// The classifier met a construct it does not understand, which means it
+		// has fallen behind mvdan/sh or goawk. Today that is still loud, matching
+		// the behaviour this binary has always had. Making it selectable is the
+		// --on-unknown-ast work in the next stage; at that point "fallthrough"
+		// becomes the recommended setting for a deployed hook, because exit 2
+		// blocks the tool.
+		failLoud("%v", res.Err)
+	}
+	if res.Class == engine.ReadOnly {
 		emitAllow()
 	}
 	// Fall-through: best-effort log, then silent exit 0.
