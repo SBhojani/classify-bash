@@ -1,113 +1,69 @@
-// classify-bash is a Claude Code PreToolUse hook for the Bash tool. It reads a
-// single PreToolUse event from stdin, classifies the embedded shell command
-// against a strict whitelist of read-only commands and flags, and emits an
-// "allow" permission decision when the command is unambiguously safe.
+// classify-bash classifies a shell command against a strict whitelist of
+// read-only commands and flags, so an agent CLI can skip its permission prompt
+// for commands that cannot have a side effect.
 //
-// Failure modes:
-//   - Bash parse failure or unsafe command: exit 0 with no stdout (fall through
-//     to Claude Code's normal permission prompt).
-//   - Undecodable or unusable event (malformed JSON, wrong event/tool, missing
-//     command): fail OPEN — log an "undecodable" record and exit 0 with no
-//     stdout. An unrecognized FIELD is not a violation at all: it is recorded as
-//     a "schema_drift" record and otherwise ignored.
-//   - Bad --log-* flag: exit 2. This is an operator error at the registration
-//     site, not harness drift, so it stays loud.
-//   - Unknown AST node kind from mvdan/sh that the classifier does not handle:
-//     exit 2. Means the classifier is out of date and must be extended before
-//     the upgrade can be trusted. NOTE: this is the last remaining path that can
-//     block a tool call, and a mvdan/sh bump could trip it; making it
-//     configurable is tracked as future work.
+// The classifier is host-agnostic and is reached through `check`. Host wire
+// formats live behind subcommands: `hook` speaks Claude Code's PreToolUse
+// protocol; pi and oh-my-pi are integrated through extension shims that call
+// `check` (see share/classify-bash/*.ts in the installed package).
+//
+// The invariant the whole design rests on: this program only ever ADDS an
+// allow. A bug in it can at worst fail to accelerate, never block. Concretely,
+// exit 2 blocks a PreToolUse call, so exit 2 is reserved for the two things
+// nothing upstream can trigger — a bad flag at the registration site, and a
+// strictness policy the operator explicitly asked to be loud about.
 package main
 
 import (
 	"fmt"
 	"os"
-	"strings"
-
-	"github.com/shabbir-genetech/classify-bash/internal/adapter/claude"
-	"github.com/shabbir-genetech/classify-bash/internal/engine"
-	"github.com/shabbir-genetech/classify-bash/internal/logging"
 )
 
 func main() {
-	// Resolve logging config first, before anything that can failLoud, so the
-	// global is in place. Strict: a bad flag failLouds (exit 2).
-	cfg, err := logging.ParseLogFlags(os.Args[1:])
-	if err != nil {
-		failLoud("bad flag: %v", err)
-	}
-	logCfg = cfg
+	args := os.Args[1:]
 
-	ev, drift, err := claude.DecodeEvent(os.Stdin)
-	// Record schema drift before acting on the error: a payload can be both
-	// undecodable and carry new fields, and the drift is the more useful signal.
-	if len(drift) > 0 {
-		logging.LogNonAllow(logCfg, "schema_drift", "", strings.Join(drift, ", "))
+	if len(args) > 0 {
+		switch args[0] {
+		case "check":
+			os.Exit(runCheck(args[1:]))
+		case "hook":
+			os.Exit(runHook(args[1:], false))
+		case "doctor":
+			os.Exit(runDoctor(args[1:]))
+		case "-h", "--help", "help":
+			usage(os.Stdout)
+			os.Exit(0)
+		}
 	}
-	if err != nil {
-		failOpen("%v", err)
-	}
-	currentCommand = ev.ToolInput.Command
 
-	res := engine.Classify(ev.ToolInput.Command)
-	if res.Err != nil {
-		// The classifier met a construct it does not understand, which means it
-		// has fallen behind mvdan/sh or goawk. Today that is still loud, matching
-		// the behaviour this binary has always had. Making it selectable is the
-		// --on-unknown-ast work in the next stage; at that point "fallthrough"
-		// becomes the recommended setting for a deployed hook, because exit 2
-		// blocks the tool.
-		failLoud("%v", res.Err)
+	// No recognised subcommand. If this looks like the pre-subcommand hook
+	// registration, honour it rather than failing — see looksLikeLegacyHook.
+	if looksLikeLegacyHook(args) {
+		os.Exit(runHook(args, true))
 	}
-	if res.Class == engine.ReadOnly {
-		emitAllow()
-	}
-	// Fall-through: best-effort log, then silent exit 0.
-	logging.LogNonAllow(logCfg, "fallthrough", ev.ToolInput.Command, "")
+
+	usage(os.Stderr)
+	os.Exit(1)
 }
 
-// logCfg and currentCommand are process-global because failLoud — reachable from
-// deep in the classifier, before main regains control — needs them to record a
-// failloud event. Both stay zero (nil / "") until main resolves them, so any
-// failLoud that fires earlier (e.g. a bad flag) simply logs nothing.
-var (
-	logCfg         *logging.Config
-	currentCommand string
-)
+func usage(w *os.File) {
+	fmt.Fprint(w, `classify-bash — classify a shell command as read-only, or not
 
-// failLoud prints "classify-bash: <msg>" to stderr and exits with code 2.
-// Used for every contract violation we want to be noisy about so we hear
-// about it rather than silently ship a stale classifier. It also best-effort
-// logs a failloud record (a no-op unless logging is configured and enabled).
-func failLoud(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	logging.LogNonAllow(logCfg, "failloud", currentCommand, msg)
-	fmt.Fprintf(os.Stderr, "classify-bash: %s\n", msg)
-	os.Exit(2)
-}
+  classify-bash check '<command>'      classify one command from argv
+  classify-bash check --stdin          classify the command read from stdin
+      --json                           print {"class","reason"} on stdout
+      --on-unknown-ast=fail|fallthrough
+    exit 0 = read-only, 1 = not read-only, 2 = this binary is broken or misused
 
-// failOpen records an event we could not use and exits 0 with empty stdout, so
-// the host falls through to its normal permission flow.
-//
-// Nothing is written to stderr: on a non-blocking exit the host may surface it
-// as noise, and the log is the intended channel for this. The rule it enforces
-// is the one the whole design rests on — a bug here can at worst fail to
-// accelerate, never block. Contrast failLoud, which is reserved for operator
-// error at the registration site (a bad flag), where being noisy is correct
-// because nothing upstream can cause it.
-func failOpen(format string, args ...any) {
-	logging.LogNonAllow(logCfg, "undecodable", currentCommand, fmt.Sprintf(format, args...))
-	os.Exit(0)
-}
+  classify-bash hook --mode=<mode>     run as a Claude Code PreToolUse hook
+      --mode=claude-strict|claude-lenient
+      --on-unknown-field=fail|log|ignore   (overrides --mode)
+      --on-unknown-ast=fail|fallthrough    (overrides --mode)
+      --log --log-to=auto|journal|file --log-file=PATH
 
-// emitAllow writes the PreToolUse allow JSON to stdout and exits 0.
-func emitAllow() {
-	// Hand-written to avoid pulling encoding/json into the hot path for a
-	// fixed response. Stable across schema additions because we only emit
-	// the fields Claude Code currently requires.
-	const out = `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}` + "\n"
-	if _, err := os.Stdout.WriteString(out); err != nil {
-		failLoud("write stdout: %v", err)
-	}
-	os.Exit(0)
+  classify-bash doctor                 report schema drift and compatibility
+
+Integrating another agent CLI means calling "check" from whatever that host
+calls a pre-execution hook. The shipped pi and oh-my-pi shims are examples.
+`)
 }

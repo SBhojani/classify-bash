@@ -1,7 +1,26 @@
 package logging
 
+import "fmt"
+
 // Public surface for the binary. The implementation and its tests stay
 // unexported and unchanged.
+
+// NewConfig builds a config directly, for callers that own their own flag
+// parsing (the subcommands, which need the log flags alongside their own).
+// Validation matches ParseLogFlags: an unknown sink is an error, and an empty
+// file falls back to the conventional state-dir path.
+func NewConfig(enabled bool, sink, file string) (*Config, error) {
+	switch sink {
+	case "auto", "journal", "file":
+	default:
+		return nil, fmt.Errorf("unknown --log-to %q (want auto, journal, or file)", sink)
+	}
+	cfg := &logConfig{enabled: enabled, sink: sink, file: file}
+	if cfg.file == "" {
+		cfg.file = defaultLogFile()
+	}
+	return cfg, nil
+}
 
 // Config is the resolved logging configuration for one invocation. It is an
 // alias rather than a wrapper so the existing unexported implementation and its
