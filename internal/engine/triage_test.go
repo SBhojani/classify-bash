@@ -1,4 +1,4 @@
-package main
+package engine
 
 // Log-corpus triage harness.
 //
@@ -39,7 +39,21 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
-// Records decode into logRecord, defined alongside the log tests in log_test.go.
+// logRecord mirrors the on-disk JSON record shape written by the logging
+// package's formatRecord. It is duplicated here rather than imported because
+// the engine deliberately does not depend on the logging package — the corpus
+// is just JSON that happens to have been produced by it. Keep in sync with
+// formatRecord if the record shape changes; a mismatched field only means a
+// blank column in the triage report, never a wrong verdict, since every record
+// is re-classified by the live classifier rather than trusted.
+
+type logRecord struct {
+	TS      string `json:"ts"`
+	Kind    string `json:"kind"`
+	Command string `json:"command"`
+	Reason  string `json:"reason"`
+	OrigLen int    `json:"orig_len"`
+}
 
 // readCorpus returns the records in the file named by $CORPUS, skipping the test
 // if unset. Non-JSON lines (journald framing, boot markers) are ignored.

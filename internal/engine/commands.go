@@ -1,4 +1,4 @@
-package main
+package engine
 
 // safeCommands is the strict whitelist: every command, subcommand, and flag
 // that classify-bash will accept. An entry here is a claim that this exact

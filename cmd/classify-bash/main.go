@@ -23,33 +23,42 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/shabbir-genetech/classify-bash/internal/adapter/claude"
+	"github.com/shabbir-genetech/classify-bash/internal/engine"
+	"github.com/shabbir-genetech/classify-bash/internal/logging"
 )
 
 func main() {
-	// Resolve logging config first, before anything that can failLoud, so the
+	// The classifier cannot exit on its own — it calls back here when it meets a
+	// construct it does not recognise. Installed first so it is in place before
+	// anything can classify.
+	engine.OnUnknownConstruct = failLoud
+
+	// Resolve logging config next, before anything that can failLoud, so the
 	// global is in place. Strict: a bad flag failLouds (exit 2).
-	cfg, err := parseLogFlags(os.Args[1:])
+	cfg, err := logging.ParseLogFlags(os.Args[1:])
 	if err != nil {
 		failLoud("bad flag: %v", err)
 	}
 	logCfg = cfg
 
-	ev, drift, err := decodeEvent(os.Stdin)
+	ev, drift, err := claude.DecodeEvent(os.Stdin)
 	// Record schema drift before acting on the error: a payload can be both
 	// undecodable and carry new fields, and the drift is the more useful signal.
 	if len(drift) > 0 {
-		logNonAllow(logCfg, "schema_drift", "", strings.Join(drift, ", "))
+		logging.LogNonAllow(logCfg, "schema_drift", "", strings.Join(drift, ", "))
 	}
 	if err != nil {
 		failOpen("%v", err)
 	}
 	currentCommand = ev.ToolInput.Command
 
-	if classifyCommand(ev.ToolInput.Command) == decisionAllow {
+	if engine.ClassifyCommand(ev.ToolInput.Command) {
 		emitAllow()
 	}
 	// Fall-through: best-effort log, then silent exit 0.
-	logNonAllow(logCfg, "fallthrough", ev.ToolInput.Command, "")
+	logging.LogNonAllow(logCfg, "fallthrough", ev.ToolInput.Command, "")
 }
 
 // logCfg and currentCommand are process-global because failLoud — reachable from
@@ -57,7 +66,7 @@ func main() {
 // failloud event. Both stay zero (nil / "") until main resolves them, so any
 // failLoud that fires earlier (e.g. a bad flag) simply logs nothing.
 var (
-	logCfg         *logConfig
+	logCfg         *logging.Config
 	currentCommand string
 )
 
@@ -67,7 +76,7 @@ var (
 // logs a failloud record (a no-op unless logging is configured and enabled).
 func failLoud(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	logNonAllow(logCfg, "failloud", currentCommand, msg)
+	logging.LogNonAllow(logCfg, "failloud", currentCommand, msg)
 	fmt.Fprintf(os.Stderr, "classify-bash: %s\n", msg)
 	os.Exit(2)
 }
@@ -82,7 +91,7 @@ func failLoud(format string, args ...any) {
 // error at the registration site (a bad flag), where being noisy is correct
 // because nothing upstream can cause it.
 func failOpen(format string, args ...any) {
-	logNonAllow(logCfg, "undecodable", currentCommand, fmt.Sprintf(format, args...))
+	logging.LogNonAllow(logCfg, "undecodable", currentCommand, fmt.Sprintf(format, args...))
 	os.Exit(0)
 }
 

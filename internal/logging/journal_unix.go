@@ -1,6 +1,6 @@
 //go:build !windows && !plan9
 
-package main
+package logging
 
 import "log/syslog"
 
